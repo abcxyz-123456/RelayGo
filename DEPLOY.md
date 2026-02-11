@@ -36,8 +36,8 @@
 
 | 类型 | 变量名称 | 值 |
 |:----:|:-------:|:---:|
-| Secret | `BOT_TOKEN` | 你的机器人 token（可以在 [@BotFather](https://t.me/BotFather) 查看 |
-| Secret | `OWNER_ID` | 你的 Telegram UID（可以通过 [@getidsbot](https://t.me/getidsbot) 获取 |
+| Secret | `BOT_TOKEN` | 你的机器人 token（可以在 [@BotFather](https://t.me/BotFather) 查看） |
+| Secret | `OWNER_ID` | 你的 Telegram UID（可以通过 [@getidsbot](https://t.me/getidsbot) 获取） |
 
 ## 六、设置 Telegram Webhook
 
