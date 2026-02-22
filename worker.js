@@ -776,11 +776,11 @@ async function initializeUser(env, groupId, msg, userId, token) {
         const username = msg.from.username ? `@${escapeHtml(msg.from.username)}` : 'None';
 
         const infoMsg = `👤 <b>新用户接入</b>\n\n` +
-            `🔸 名称：${fullName}\n` +
-            `🆔 UID：<a href="${uidLink}">${userId}</a>\n` +
+            `🔸 名称：<a href="${uidLink}">${fullName}</a>\n` +
+            `🆔 UID：${userId}\n` +
             `💫 用户名：${username}`;
 
-        await tgRequest(token, 'sendMessage', { chat_id: groupId, message_thread_id: threadId, text: infoMsg, parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: "👉 点击查看", url: uidLink }]] } });
+        await tgRequest(token, 'sendMessage', { chat_id: groupId, message_thread_id: threadId, text: infoMsg, parse_mode: 'HTML' });
         await sendWelcomeMessage(env, userId);
 
         if (!msg.text || !msg.text.startsWith('/start')) {
