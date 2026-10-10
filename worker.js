@@ -179,6 +179,17 @@ async function tgRequest(token, method, payload) {
     }
 }
 
+// 给原始消息添加 Telegram 原生表情回应；失败不应影响消息转发。
+async function reactToMessage(token, chatId, messageId) {
+    if (!token || chatId === undefined || chatId === null || !messageId) return;
+    return tgRequest(token, 'setMessageReaction', {
+        chat_id: chatId,
+        message_id: messageId,
+        reaction: [{ type: 'emoji', emoji: '🐳' }],
+        is_big: false,
+    });
+}
+
 function isTopicNotFoundError(result) {
     if (!result || result.ok) return false;
     const desc = (result.description || '').toLowerCase();
@@ -913,7 +924,10 @@ async function handleGroupMessage(env, msg) {
             return tgRequest(env.BOT_TOKEN, 'sendMessage', { chat_id: msg.chat.id, message_thread_id: msg.message_thread_id, text: "✅ 用户已解除封禁。" });
         }
     }
-    const result = await forwardMessage(env, env.BOT_TOKEN, userId, msg.chat.id, msg);
+    const [, result] = await Promise.all([
+        reactToMessage(env.BOT_TOKEN, msg.chat.id, msg.message_id),
+        forwardMessage(env, env.BOT_TOKEN, userId, msg.chat.id, msg),
+    ]);
     if (result && !result.ok) {
         if (isUserBlockedError(result)) {
             await tgRequest(env.BOT_TOKEN, 'sendMessage', {
@@ -1005,7 +1019,11 @@ async function handleUserPrivateMessage(env, groupId, msg) {
                 }
             }
         }
-        return forwardToGroupWithRecovery(env, token, groupId, userId, msg, userData.thread_id, userData);
+        const [, result] = await Promise.all([
+            reactToMessage(token, userId, msg.message_id),
+            forwardToGroupWithRecovery(env, token, groupId, userId, msg, userData.thread_id, userData),
+        ]);
+        return result;
     }
 
     // 曾接入但话题映射丢失（如话题被删后清理不完整）
@@ -1148,7 +1166,10 @@ async function initializeUser(env, groupId, msg, userId, token, options = {}) {
         if (!recreate) await sendWelcomeMessage(env, userId);
 
         if (!msg.text || !msg.text.startsWith('/start')) {
-            await forwardMessage(env, token, groupId, userId, msg, threadId);
+            await Promise.all([
+                reactToMessage(token, userId, msg.message_id),
+                forwardMessage(env, token, groupId, userId, msg, threadId),
+            ]);
         }
     } catch (e) {
         return tgRequest(token, 'sendMessage', { chat_id: userId, text: "Error: " + e.message });

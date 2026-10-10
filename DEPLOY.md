@@ -61,6 +61,8 @@ https://api.telegram.org/bot123456:ABCDEFG/setWebhook?url=https://relaygobot.exa
 
 一般情况下，机器人会自动绑定群组。如果自动绑定没有生效，请在群组中发送 `/bind` 命令手动绑定。
 
+为启用聊天消息的 🐳 原生表情回应，请同时确保机器人具有群组的“添加表情回应 / Manage Chat Reactions”权限（Telegram 客户端可能会将其显示为“管理消息反应”）。如果未授予该权限，群组内的回应可能会被 Telegram 拒绝；这不会影响消息转发。
+
 一切准备就绪，可以开始使用了！
 
 -----
