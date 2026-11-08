@@ -298,6 +298,13 @@ export default {
             // Webhook 路径验证
             const url = new URL(request.url);
             if (request.method === 'POST' && (url.pathname === '/webhook' || url.pathname.startsWith('/webhook'))) {
+                // 校验 Telegram Secret Token，防止未经身份验证的伪造请求（可选配置，向下兼容）
+                if (env.WEBHOOK_SECRET) {
+                    const secretHeader = request.headers.get('X-Telegram-Bot-Api-Secret-Token');
+                    if (secretHeader !== env.WEBHOOK_SECRET) {
+                        return errorResponse('Unauthorized', 401);
+                    }
+                }
                 const update = await request.json();
                 ctx.waitUntil(handleUpdate(env, update, ctx));
                 return jsonResponse({ ok: true });
