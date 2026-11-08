@@ -1,7 +1,7 @@
 /**
  * RelayGo - 新一代 Telegram 私聊机器人
  * 项目地址: https://github.com/abcxyz-123456/RelayGo
- * 版本: 1.1.8 (Standalone)
+ * 版本: 1.1.9 (Standalone)
  * 官方频道：https://t.me/RelayGo
  * 当前版本可能仍不稳定，如遇到 BUG 请提交至 issues
  */
@@ -87,10 +87,24 @@ function shouldFormatAsReply(msg) {
     return true;
 }
 
-function buildReplyPrefix(replyToMsg) {
-    const prefix = '回复： ';
+function buildMessagePrefix(replyToMsg = null, isEdited = false) {
+    const editTag = isEdited ? '✏️ [消息已更新]\n' : '';
+    if (!replyToMsg) {
+        if (!editTag) return null;
+        const prefix = editTag + '\n';
+        return {
+            prefix,
+            quotedText: '',
+            separator: '',
+            headerLength: utf16Length(prefix),
+            blockquoteOffset: 0,
+            blockquoteLength: 0,
+        };
+    }
+    const replyPrefix = '回复： ';
     const quotedText = getMessageTextContent(replyToMsg);
     const separator = '\n\n';
+    const prefix = editTag + replyPrefix;
     return {
         prefix,
         quotedText,
@@ -101,13 +115,20 @@ function buildReplyPrefix(replyToMsg) {
     };
 }
 
+function buildReplyPrefix(replyToMsg) {
+    return buildMessagePrefix(replyToMsg, false);
+}
+
 function shiftEntities(entities, offset) {
     if (!entities?.length) return undefined;
     return entities.map(e => ({ ...e, offset: e.offset + offset }));
 }
 
 function buildReplyEntities(prefixInfo, contentEntities) {
-    const entities = [{ type: 'blockquote', offset: prefixInfo.blockquoteOffset, length: prefixInfo.blockquoteLength }];
+    const entities = [];
+    if (prefixInfo.blockquoteLength > 0) {
+        entities.push({ type: 'blockquote', offset: prefixInfo.blockquoteOffset, length: prefixInfo.blockquoteLength });
+    }
     const shifted = shiftEntities(contentEntities, prefixInfo.headerLength);
     if (shifted) entities.push(...shifted);
     return entities;
@@ -121,15 +142,24 @@ function isTextOnlyMessage(msg) {
 
 async function sendReplyHeader(token, basePayload, prefixInfo) {
     const fullPrefix = prefixInfo.prefix + prefixInfo.quotedText + prefixInfo.separator;
-    return tgRequest(token, 'sendMessage', {
+    const payload = {
         ...basePayload,
         text: fullPrefix.trimEnd(),
-        entities: [{ type: 'blockquote', offset: prefixInfo.blockquoteOffset, length: prefixInfo.blockquoteLength }],
-    });
+    };
+    if (prefixInfo.blockquoteLength > 0) {
+        payload.entities = [{ type: 'blockquote', offset: prefixInfo.blockquoteOffset, length: prefixInfo.blockquoteLength }];
+    }
+    return tgRequest(token, 'sendMessage', payload);
 }
 
-async function forwardMessageWithReply(token, targetChatId, fromChatId, msg, threadId) {
-    const prefixInfo = buildReplyPrefix(msg.reply_to_message);
+async function forwardMessageWithPrefix(token, targetChatId, fromChatId, msg, threadId, replyToMsg = null, isEdited = false) {
+    const prefixInfo = buildMessagePrefix(replyToMsg, isEdited);
+    if (!prefixInfo) {
+        const copyPayload = { chat_id: targetChatId, from_chat_id: fromChatId, message_id: msg.message_id };
+        if (threadId) copyPayload.message_thread_id = threadId;
+        return tgRequest(token, 'copyMessage', copyPayload);
+    }
+
     const fullPrefix = prefixInfo.prefix + prefixInfo.quotedText + prefixInfo.separator;
     const basePayload = { chat_id: targetChatId };
     if (threadId) basePayload.message_thread_id = threadId;
@@ -142,8 +172,25 @@ async function forwardMessageWithReply(token, targetChatId, fromChatId, msg, thr
         });
     }
 
-    const caption = fullPrefix + (msg.caption || '');
-    const captionEntities = buildReplyEntities(prefixInfo, msg.caption_entities);
+    let caption = fullPrefix + (msg.caption || '');
+    let captionEntities = buildReplyEntities(prefixInfo, msg.caption_entities);
+    if (utf16Length(caption) > 1024) {
+        const suffix = '...[截断]';
+        const suffixLen = utf16Length(suffix);
+        const maxRawCaptionLen = Math.max(0, 1024 - prefixInfo.headerLength - suffixLen);
+        const rawCaption = msg.caption || '';
+        caption = fullPrefix + rawCaption.slice(0, maxRawCaptionLen) + suffix;
+        const totalLen = utf16Length(caption);
+        if (captionEntities) {
+            captionEntities = captionEntities
+                .filter(e => e.offset < totalLen)
+                .map(e => ({
+                    ...e,
+                    length: Math.min(e.length, totalLen - e.offset)
+                }))
+                .filter(e => e.length > 0);
+        }
+    }
     const mediaPayload = { ...basePayload, caption, caption_entities: captionEntities };
 
     if (msg.photo) return tgRequest(token, 'sendPhoto', { ...mediaPayload, photo: msg.photo[msg.photo.length - 1].file_id });
@@ -159,6 +206,10 @@ async function forwardMessageWithReply(token, targetChatId, fromChatId, msg, thr
     const copyPayload = { chat_id: targetChatId, from_chat_id: fromChatId, message_id: msg.message_id };
     if (threadId) copyPayload.message_thread_id = threadId;
     return tgRequest(token, 'copyMessage', copyPayload);
+}
+
+async function forwardMessageWithReply(token, targetChatId, fromChatId, msg, threadId) {
+    return forwardMessageWithPrefix(token, targetChatId, fromChatId, msg, threadId, msg.reply_to_message, false);
 }
 
 const jsonResponse = (data, status = 200) => new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json', ...CORS_HEADERS } });
@@ -179,28 +230,40 @@ async function tgRequest(token, method, payload) {
     }
 }
 
-// 给原始消息添加 Telegram 原生表情回应；支持相册防抖与静默容错
-const recentReactionMediaGroups = new Set();
-async function reactToMessage(token, chatId, messageId, mediaGroupId = null) {
-    if (!token || chatId === undefined || chatId === null || !messageId) return;
-    if (mediaGroupId) {
-        if (recentReactionMediaGroups.has(mediaGroupId)) return;
-        recentReactionMediaGroups.add(mediaGroupId);
-        setTimeout(() => recentReactionMediaGroups.delete(mediaGroupId), 10000);
-    }
+// 自动接管与注册各角色命令列表
+async function setupBotCommands(token, ownerId = null) {
     try {
-        await fetch(`https://api.telegram.org/bot${token}/setMessageReaction`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                chat_id: chatId,
-                message_id: messageId,
-                reaction: [{ type: 'emoji', emoji: '🐳' }],
-                is_big: false,
-            })
+        // 1. 普通用户私聊命令
+        await tgRequest(token, 'setMyCommands', {
+            commands: [
+                { command: 'start', description: '启动机器人 / Start' },
+                { command: 'ping', description: '测试延迟 / Ping' }
+            ],
+            scope: { type: 'all_private_chats' }
         });
-    } catch (_) {
-        // 静默处理，避免群组禁用 reaction 时刷屏错误日志
+
+        // 2. 群组管理员命令
+        await tgRequest(token, 'setMyCommands', {
+            commands: [
+                { command: 'ping', description: '测试延迟 / Ping' },
+                { command: 'ban', description: '封禁当前话题用户 / Ban' },
+                { command: 'unban', description: '解封当前话题用户 / Unban' }
+            ],
+            scope: { type: 'all_chat_administrators' }
+        });
+
+        // 3. 所有者私聊专属命令 (包含 /menu)
+        if (ownerId && String(ownerId) !== 'null' && String(ownerId) !== 'undefined') {
+            await tgRequest(token, 'setMyCommands', {
+                commands: [
+                    { command: 'menu', description: '管理控制面板 / Settings' },
+                    { command: 'ping', description: '测试延迟 / Ping' }
+                ],
+                scope: { type: 'chat', chat_id: ownerId }
+            });
+        }
+    } catch (e) {
+        console.error('[setupBotCommands Error]:', e);
     }
 }
 
@@ -225,7 +288,10 @@ async function clearStaleTopicMapping(env, userId, threadId) {
             await env.KV.delete(userKey);
         }
     }
-    if (threadId) await env.KV.delete(`thread:${threadId}`);
+    if (threadId) {
+        await env.KV.delete(`thread:${threadId}`);
+        memDelete(`thread:${threadId}`);
+    }
     memDelete(userKey);
     console.log(`[TopicRecovery] Cleared stale mapping for user ${userId}, thread ${threadId}`);
 }
@@ -289,7 +355,7 @@ function parseButtons(input) {
                 }
             }
 
-            if (text && url) {
+            if (text && url && /^(https?:\/\/|tg:\/\/)/i.test(url)) {
                 row.push({ text, url });
                 totalCount++;
             }
@@ -334,7 +400,7 @@ export default {
                 ctx.waitUntil(handleUpdate(env, update, ctx));
                 return jsonResponse({ ok: true });
             }
-            return jsonResponse({ status: 'running', version: '1.1.8 (Standalone)' });
+            return jsonResponse({ status: 'running', version: '1.1.9 (Standalone)' });
         } catch (e) {
             ctx.waitUntil(reportError(env, e, "Main Fetch Loop"));
             return errorResponse(e.message);
@@ -386,9 +452,13 @@ async function handleUpdate(env, update, ctx) {
                 const getMe = await tgRequest(token, 'getMe', {});
                 if (getMe.ok) await env.KV.put('config:bot_username', getMe.result.username);
 
+                // 自动同步客户端指令菜单
+                ctx.waitUntil(setupBotCommands(token, ownerId));
+                await env.KV.put('config:commands_synced', '1');
+
                 await tgRequest(token, 'sendMessage', {
                     chat_id: chat.id,
-                    text: "✅ <b>机器人已绑定此群组！</b>\n\n权限检查通过，私聊转发功能已就绪。",
+                    text: "✅ <b>机器人已绑定此群组！</b>\n\n权限检查通过，私聊转发功能已就绪，命令菜单已自动配置。",
                     parse_mode: 'HTML'
                 });
 
@@ -400,7 +470,8 @@ async function handleUpdate(env, update, ctx) {
     }
 
     // 手动绑定逻辑 (/bind)
-    if (update.message && update.message.chat.type !== 'private' && update.message.text === '/bind') {
+    const groupCmd = (update.message?.text || '').split('@')[0].trim();
+    if (update.message && update.message.chat.type !== 'private' && groupCmd === '/bind') {
         const chat = update.message.chat;
         const userId = String(update.message.from.id);
 
@@ -415,8 +486,7 @@ async function handleUpdate(env, update, ctx) {
             }
 
             // 检查自身权限
-            const getMe = await tgRequest(token, 'getMe', {});
-            const botUserId = getMe.result.id;
+            const botUserId = token.split(':')[0];
             const memberInfo = await tgRequest(token, 'getChatMember', { chat_id: chat.id, user_id: botUserId });
 
             if (!memberInfo.ok || memberInfo.result.status !== 'administrator') {
@@ -430,9 +500,13 @@ async function handleUpdate(env, update, ctx) {
             await env.KV.put('config:group_id', String(chat.id));
             if (getMe.ok) await env.KV.put('config:bot_username', getMe.result.username);
 
+            // 自动同步客户端指令菜单
+            ctx.waitUntil(setupBotCommands(token, ownerId));
+            await env.KV.put('config:commands_synced', '1');
+
             return tgRequest(token, 'sendMessage', {
                 chat_id: chat.id,
-                text: `✅ <b>绑定成功！</b>\n\n群组 ID：<code>${chat.id}</code>\n群组名称：${escapeHtml(chat.title)}\n\n现在所有私聊消息将转发至此。`,
+                text: `✅ <b>绑定成功！</b>\n\n群组 ID：<code>${chat.id}</code>\n群组名称：${escapeHtml(chat.title)}\n\n现在所有私聊消息将转发至此，指令菜单已配置完成。`,
                 parse_mode: 'HTML'
             });
 
@@ -443,27 +517,33 @@ async function handleUpdate(env, update, ctx) {
 
     const groupId = await env.KV.get('config:group_id');
 
+    const msg = update.message || update.edited_message;
+    const isEdited = Boolean(update.edited_message);
+    if (!msg) return;
+
     // 处理已绑定群组的消息
-    if (update.message && String(update.message.chat.id) === groupId) {
-        return handleGroupMessage(env, update.message);
+    if (String(msg.chat.id) === groupId) {
+        return handleGroupMessage(env, msg, isEdited);
     }
 
     // 私聊消息
-    if (update.message && update.message.chat.type === 'private') {
-        const currentUserId = String(update.message.from.id);
+    if (msg.chat.type === 'private') {
+        const currentUserId = String(msg.from.id);
         if (currentUserId === ownerId) {
-            return handleOwnerMenu(env, update.message, ctx);
+            if (isEdited) return;
+            return handleOwnerMenu(env, msg, ctx);
         }
-        return handleUserPrivateMessage(env, groupId, update.message);
+        return handleUserPrivateMessage(env, groupId, msg, isEdited);
     }
 }
 
 // 转发消息（支持媒体组相册）
 const mediaGroupBuffers = new Map();
 
-async function forwardMessage(env, token, targetChatId, fromChatId, msg, threadId = null) {
-    if (shouldFormatAsReply(msg) && !msg.media_group_id) {
-        return forwardMessageWithReply(token, targetChatId, fromChatId, msg, threadId);
+async function forwardMessage(env, token, targetChatId, fromChatId, msg, threadId = null, isEdited = false) {
+    const hasReply = shouldFormatAsReply(msg);
+    if ((hasReply || isEdited) && (!msg.media_group_id || isEdited)) {
+        return forwardMessageWithPrefix(token, targetChatId, fromChatId, msg, threadId, hasReply ? msg.reply_to_message : null, isEdited);
     }
 
     if (!msg.media_group_id) {
@@ -510,8 +590,8 @@ async function forwardMessage(env, token, targetChatId, fromChatId, msg, threadI
     }
 }
 
-async function forwardToGroupWithRecovery(env, token, groupId, userId, msg, threadId, userData) {
-    const result = await forwardMessage(env, token, groupId, userId, msg, threadId);
+async function forwardToGroupWithRecovery(env, token, groupId, userId, msg, threadId, userData, isEdited = false) {
+    const result = await forwardMessage(env, token, groupId, userId, msg, threadId, isEdited);
     if (result === undefined) return;
     if (result.ok || !isTopicNotFoundError(result)) {
         if (!result.ok) console.error(`[ForwardError] user ${userId}: ${result.description}`);
@@ -520,7 +600,7 @@ async function forwardToGroupWithRecovery(env, token, groupId, userId, msg, thre
 
     console.log(`[TopicRecovery] Topic ${threadId} missing for user ${userId}, recreating session`);
     await clearStaleTopicMapping(env, userId, threadId);
-    return initializeUser(env, groupId, msg, userId, token, { recreate: true, preserveBan: userData?.is_banned });
+    return initializeUser(env, groupId, msg, userId, token, { recreate: true, preserveBan: userData?.is_banned, isEdited });
 }
 
 // 设置菜单
@@ -531,7 +611,7 @@ async function generateSettingsMenu(env) {
     const autoReplyMsg = await env.KV.get('config:auto_reply_msg');
     const botUsername = await env.KV.get('config:bot_username') || 'My Bot';
     const unionStatus = unionBan ? '🟢 开启' : '🔴 关闭';
-    let verifyDisplay = unionBan ? '🛡 Tunstile' : (['🔴 关闭', '🔢 算数', '🎨 贴纸'][['off', 'math', 'sticker'].indexOf(verifyMode)] || '🔴 关闭');
+    let verifyDisplay = unionBan ? '🛡 Turnstile' : (['🔴 关闭', '🔢 算数', '🎨 贴纸'][['off', 'math', 'sticker'].indexOf(verifyMode)] || '🔴 关闭');
     const replyStatus = autoReplyMsg ? '🟢 已启用' : '⚪️ 已关闭';
 
     const info = `🛠 <b>${escapeHtml(botUsername)} 管理面板</b>\n\n` +
@@ -657,9 +737,31 @@ async function handleOwnerCallback(env, query) {
         return tgRequest(token, 'answerCallbackQuery', { callback_query_id: query.id });
     }
 
+    else if (data === 'refresh_menu') {
+        await setupBotCommands(token, String(chatId));
+        await env.KV.put('config:commands_synced', '1');
+        const menu = await generateSettingsMenu(env);
+        try { await tgRequest(token, 'editMessageText', { chat_id: chatId, message_id: messageId, text: menu.text, parse_mode: 'HTML', reply_markup: menu.reply_markup }); } catch (e) { }
+        return tgRequest(token, 'answerCallbackQuery', { callback_query_id: query.id, text: "✅ 面板与指令菜单已同步刷新！" });
+    }
+
     const menu = await generateSettingsMenu(env);
     try { await tgRequest(token, 'editMessageText', { chat_id: chatId, message_id: messageId, text: menu.text, parse_mode: 'HTML', reply_markup: menu.reply_markup }); } catch (e) { }
     return tgRequest(token, 'answerCallbackQuery', { callback_query_id: query.id });
+}
+
+// 确保命令菜单仅同步一次（带内存缓存）
+async function ensureCommandsSynced(env, token, ownerId, ctx) {
+    let synced = memGet('config:commands_synced');
+    if (synced === undefined) {
+        synced = await env.KV.get('config:commands_synced');
+        if (synced) memSet('config:commands_synced', synced);
+    }
+    if (!synced) {
+        ctx.waitUntil(setupBotCommands(token, ownerId));
+        await env.KV.put('config:commands_synced', '1');
+        memSet('config:commands_synced', '1');
+    }
 }
 
 async function handleOwnerMenu(env, msg, ctx) {
@@ -667,11 +769,26 @@ async function handleOwnerMenu(env, msg, ctx) {
     const chatId = msg.chat.id;
     let text = msg.text || '';
 
+    // 快捷同步指令菜单
+    if (text === '/sync' || text === '/sync_commands') {
+        await setupBotCommands(token, String(chatId));
+        await env.KV.put('config:commands_synced', '1');
+        memSet('config:commands_synced', '1');
+        return tgRequest(token, 'sendMessage', { chat_id: chatId, text: "✅ 机器人命令菜单已全自动同步到 Telegram 客户端！\n（普通用户、群管理员、所有者分级菜单已就绪）" });
+    }
+
     if (text === '/start') {
-        return tgRequest(token, 'sendMessage', { chat_id: chatId, text: `👋 您好，机器人管理员！\n\n您看到此消息说明机器人已成功启动。\n\n当前版本：1.1.8 (Standalone) \n发送 /menu 显示管理菜单`, parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '查看帮助文档', url: 'https://t.me/RelayGo/14' }]] } });
+        await ensureCommandsSynced(env, token, String(chatId), ctx);
+        return tgRequest(token, 'sendMessage', { chat_id: chatId, text: `👋 您好，机器人管理员！\n\n您看到此消息说明机器人已成功启动。\n\n当前版本：1.1.9 (Standalone) \n发送 /menu 显示管理菜单`, parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '查看帮助文档', url: 'https://t.me/RelayGo/14' }]] } });
+    }
+
+    if (text === '/ping' || text.startsWith('/ping@')) {
+        const latency = Math.max(1, Date.now() - msg.date * 1000);
+        return tgRequest(token, 'sendMessage', { chat_id: chatId, text: `🏓 Pong! 耗时: ${latency}ms` });
     }
 
     if (text === '/menu') {
+        await ensureCommandsSynced(env, token, String(chatId), ctx);
         const menu = await generateSettingsMenu(env);
         return tgRequest(token, 'sendMessage', { chat_id: chatId, text: menu.text, parse_mode: 'HTML', reply_markup: menu.reply_markup });
     }
@@ -731,7 +848,8 @@ async function handleOwnerMenu(env, msg, ctx) {
             if ((sent + failed) > 0 && (sent + failed) % 25 === 0) await new Promise(r => setTimeout(r, 1000));
         }
 
-        return { sent: offset + sent, failed, skipped, total, hasMore: offset + sent + skipped < total && !timedOut, nextOffset: offset + sent + skipped, timedOut };
+        const processed = sent + failed + skipped;
+        return { sent: offset + sent, failed, skipped, total, hasMore: offset + processed < total && !timedOut, nextOffset: offset + processed, timedOut };
     }
 
     // 广播状态检查
@@ -815,11 +933,11 @@ async function handleOwnerMenu(env, msg, ctx) {
     if (text.startsWith('/broadcast')) {
         const bodyContent = text.replace('/broadcast', '').trim();
         if (bodyContent.length > 0) {
-            const draft = { from_chat_id: chatId, message_id: msg.message_id };
+            const draft = { from_chat_id: chatId, text: bodyContent };
             await setBroadcastDraft(env, chatId, draft);
             await setBroadcastState(env, chatId, 'waiting_confirm');
 
-            await tgRequest(token, 'copyMessage', { chat_id: chatId, from_chat_id: chatId, message_id: msg.message_id });
+            await tgRequest(token, 'sendMessage', { chat_id: chatId, text: bodyContent });
             return tgRequest(token, 'sendMessage', {
                 chat_id: chatId,
                 text: "📢 <b>广播预览如上</b>\n\n如确认无误，请发送 <code>/confirm</code> 开始发布广播；\n如需取消，请发送 <code>/cancel</code> 。",
@@ -851,8 +969,8 @@ async function handleOwnerMenu(env, msg, ctx) {
     }
 
     // 手动封禁/解封
-    if (text.startsWith('/ban ')) {
-        const targetId = text.split(' ')[1];
+    if (text.startsWith('/ban ') || text.startsWith('/ban@')) {
+        const targetId = text.replace(/^\/ban(?:@\w+)?/i, '').trim().split(/\s+/)[0];
         if (!targetId) return tgRequest(token, 'sendMessage', { chat_id: chatId, text: "❌ 命令错误。用法: <code>/ban</code> <uid>", parse_mode: 'HTML' });
 
         const userTopic = await env.KV.get(`user:${targetId}`, { type: 'json' });
@@ -870,8 +988,8 @@ async function handleOwnerMenu(env, msg, ctx) {
             parse_mode: 'HTML'
         });
     }
-    if (text.startsWith('/unban ')) {
-        const targetId = text.split(' ')[1];
+    if (text.startsWith('/unban ') || text.startsWith('/unban@')) {
+        const targetId = text.replace(/^\/unban(?:@\w+)?/i, '').trim().split(/\s+/)[0];
         if (!targetId) return tgRequest(token, 'sendMessage', { chat_id: chatId, text: "❌ 命令错误。用法: <code>/unban</code> <uid>", parse_mode: 'HTML' });
 
         const userTopic = await env.KV.get(`user:${targetId}`, { type: 'json' });
@@ -911,24 +1029,37 @@ async function handleOwnerMenu(env, msg, ctx) {
         memDelete('config:auto_reply_msg');
         return tgRequest(token, 'sendMessage', { chat_id: chatId, text: "✅ 自动回复已更新。" });
     }
-    if (text === '/bcancel') {
-        await env.KV.delete(`broadcast_msg:${chatId}`);
-        return tgRequest(token, 'sendMessage', { chat_id: chatId, text: "✅ 已取消广播" });
-    }
     return tgRequest(token, 'sendMessage', { chat_id: chatId, text: "🤖 发送 /menu 打开面板" });
 }
 
 // 处理群组消息 (Topic 内回复)
-async function handleGroupMessage(env, msg) {
+async function handleGroupMessage(env, msg, isEdited = false) {
+    if (msg.text) {
+        const cmd = msg.text.split('@')[0].trim();
+        if (cmd === '/ping') {
+            if (isEdited) return;
+            const latency = Math.max(1, Date.now() - msg.date * 1000);
+            const payload = { chat_id: msg.chat.id, text: `🏓 Pong! 耗时: ${latency}ms` };
+            if (msg.message_thread_id) payload.message_thread_id = msg.message_thread_id;
+            return tgRequest(env.BOT_TOKEN, 'sendMessage', payload);
+        }
+    }
     if (!msg.is_topic_message || !msg.message_thread_id) return;
     if (isServiceMessage(msg) || (msg.from && msg.from.is_bot)) return;
 
-    // 通过 Thread ID 反查 User ID
-    const userId = String(await env.KV.get(`thread:${msg.message_thread_id}`));
+    // 通过 Thread ID 反查 User ID (内存缓存 → KV)
+    const threadKey = `thread:${msg.message_thread_id}`;
+    let userId = memGet(threadKey);
+    if (userId === undefined) {
+        userId = await env.KV.get(threadKey);
+        if (userId) memSet(threadKey, userId);
+    }
     if (!userId) return;
 
     if (msg.text && msg.text.startsWith('/')) {
-        if (msg.text === '/ban') {
+        if (isEdited) return;
+        const topicCmd = msg.text.split('@')[0].trim();
+        if (topicCmd === '/ban') {
             const userData = await env.KV.get(`user:${userId}`, { type: 'json' }) || { thread_id: msg.message_thread_id };
             userData.is_banned = true;
             await env.KV.put(`user:${userId}`, JSON.stringify(userData));
@@ -936,7 +1067,7 @@ async function handleGroupMessage(env, msg) {
 
             return tgRequest(env.BOT_TOKEN, 'sendMessage', { chat_id: msg.chat.id, message_thread_id: msg.message_thread_id, text: "🚫 用户已封禁。" });
         }
-        if (msg.text === '/unban') {
+        if (topicCmd === '/unban') {
             const userData = await env.KV.get(`user:${userId}`, { type: 'json' }) || { thread_id: msg.message_thread_id };
             userData.is_banned = false;
             await env.KV.put(`user:${userId}`, JSON.stringify(userData));
@@ -945,10 +1076,7 @@ async function handleGroupMessage(env, msg) {
             return tgRequest(env.BOT_TOKEN, 'sendMessage', { chat_id: msg.chat.id, message_thread_id: msg.message_thread_id, text: "✅ 用户已解除封禁。" });
         }
     }
-    const [, result] = await Promise.all([
-        reactToMessage(env.BOT_TOKEN, msg.chat.id, msg.message_id, msg.media_group_id),
-        forwardMessage(env, env.BOT_TOKEN, userId, msg.chat.id, msg),
-    ]);
+    const result = await forwardMessage(env, env.BOT_TOKEN, userId, msg.chat.id, msg, null, isEdited);
     if (result && !result.ok) {
         if (isUserBlockedError(result)) {
             await tgRequest(env.BOT_TOKEN, 'sendMessage', {
@@ -969,7 +1097,7 @@ async function handleGroupMessage(env, msg) {
 }
 
 // 用户私聊核心逻辑
-async function handleUserPrivateMessage(env, groupId, msg) {
+async function handleUserPrivateMessage(env, groupId, msg, isEdited = false) {
     const userId = String(msg.from.id);
     const token = env.BOT_TOKEN;
 
@@ -988,6 +1116,16 @@ async function handleUserPrivateMessage(env, groupId, msg) {
             text: "🚫 您已被本机器人封禁，如有疑问请联系管理员。",
             parse_mode: 'HTML',
         });
+    }
+
+    // 响应 /ping
+    if (msg.text) {
+        const cmd = msg.text.split('@')[0].trim();
+        if (cmd === '/ping') {
+            if (isEdited) return;
+            const latency = Math.max(1, Date.now() - msg.date * 1000);
+            return tgRequest(token, 'sendMessage', { chat_id: userId, text: `🏓 Pong! 耗时: ${latency}ms` });
+        }
     }
 
     // 2. 读取联合封禁配置（内存缓存 → KV）
@@ -1016,43 +1154,54 @@ async function handleUserPrivateMessage(env, groupId, msg) {
         }
     }
 
-    // 刷新 verify cache
-    if (msg.text && msg.text.startsWith('/start refresh_') && isUnionBanEnabled) {
-        return handleUnionRefresh(env, groupId, msg, userId, token);
-    }
-
     // 已验证用户
     if (userData && userData.thread_id) {
-        if (msg.text === '/start') return sendWelcomeMessage(env, userId);
+        if (!isEdited && msg.text && msg.text.startsWith('/start refresh_') && isUnionBanEnabled) {
+            return tgRequest(token, 'sendMessage', { chat_id: userId, text: "✅ 验证状态正常，您已在此前通过验证，可直接发送消息。" });
+        }
+        if (!isEdited && msg.text === '/start') return sendWelcomeMessage(env, userId);
 
-        // 自动回复（媒体组只触发一次，内存缓存 → KV）
-        if (!msg.media_group_id) {
-            let autoReplyMsg = memGet('config:auto_reply_msg');
-            if (autoReplyMsg === undefined) {
-                autoReplyMsg = await env.KV.get('config:auto_reply_msg');
-                memSet('config:auto_reply_msg', autoReplyMsg);
+        const sessionKey = `session:${userId}`;
+        let session = await env.KV.get(sessionKey, { type: 'json' });
+        if (!session) {
+            session = { t: Date.now(), r: false, e: false };
+        } else {
+            session.t = Date.now();
+        }
+
+        if (isEdited) {
+            if (!session.e) {
+                await tgRequest(token, 'sendMessage', { chat_id: userId, text: "✅ 更新后的消息已转达" });
+                session.e = true;
             }
-            if (autoReplyMsg) {
-                const replyKey = `last_reply:${userId}`;
-                if (!(await env.KV.get(replyKey))) {
+        } else {
+            if (!msg.media_group_id && !session.r) {
+                let autoReplyMsg = memGet('config:auto_reply_msg');
+                if (autoReplyMsg === undefined) {
+                    autoReplyMsg = await env.KV.get('config:auto_reply_msg');
+                    memSet('config:auto_reply_msg', autoReplyMsg);
+                }
+                if (autoReplyMsg) {
                     await tgRequest(token, 'sendMessage', { chat_id: userId, text: autoReplyMsg });
-                    await env.KV.put(replyKey, '1', { expirationTtl: 600 });
+                    session.r = true;
                 }
             }
         }
-        const [, result] = await Promise.all([
-            reactToMessage(token, userId, msg.message_id, msg.media_group_id),
-            forwardToGroupWithRecovery(env, token, groupId, userId, msg, userData.thread_id, userData),
-        ]);
-        return result;
+        await env.KV.put(sessionKey, JSON.stringify(session), { expirationTtl: 600 });
+
+        return forwardToGroupWithRecovery(env, token, groupId, userId, msg, userData.thread_id, userData, isEdited);
     }
 
     // 曾接入但话题映射丢失（如话题被删后清理不完整）
     if (userData && userData.user_info && !userData.thread_id) {
-        return initializeUser(env, groupId, msg, userId, token, { recreate: true, preserveBan: userData.is_banned });
+        return initializeUser(env, groupId, msg, userId, token, { recreate: true, preserveBan: userData.is_banned, isEdited });
     }
 
     // 新用户验证
+    if (msg.text && msg.text.startsWith('/start refresh_') && isUnionBanEnabled) {
+        return handleUnionRefresh(env, groupId, msg, userId, token);
+    }
+
     if (isUnionBanEnabled) {
         const botUsername = memGet('config:bot_username') || await env.KV.get('config:bot_username') || "Bot";
         memSet('config:bot_username', botUsername);
@@ -1062,7 +1211,7 @@ async function handleUserPrivateMessage(env, groupId, msg) {
 
         return tgRequest(token, 'sendMessage', {
             chat_id: userId,
-            text: "🔒 <b>安全验证</b>\n\n本机器人已接入联合人机安全验证，请点击下方按钮验证身份。\n\n请在 10 分钟内完成完成验证并返回，超时将导致被封禁。",
+            text: "🔒 <b>安全验证</b>\n\n本机器人已接入联合人机安全验证，请点击下方按钮验证身份。\n\n请在 10 分钟内完成验证并返回，超时将导致被封禁。",
             parse_mode: 'HTML',
             reply_markup: { inline_keyboard: [[{ text: "👉 点击验证 (Click to Verify)", url: webAppUrl }]] }
         });
@@ -1107,11 +1256,11 @@ async function handleLocalVerification(env, groupId, msg, userId, token, mode) {
     if (!pendingState && msg.text === '/start') {
         if (mode === 'sticker') {
             await env.KV.put(tempKey, JSON.stringify({ type: 'sticker' }), { expirationTtl: 180 });
-            return tgRequest(token, 'sendMessage', { chat_id: userId, text: "🔒 <b>安全验证</b>\n\n本机器人已开启人机验证，请发送任意 <em>贴纸（Stickers）</em> 以通过验证。\n\n请在 2 分钟内完成完成验证，超时将导致被封禁。", parse_mode: 'HTML' });
+            return tgRequest(token, 'sendMessage', { chat_id: userId, text: "🔒 <b>安全验证</b>\n\n本机器人已开启人机验证，请发送任意 <em>贴纸（Stickers）</em> 以通过验证。\n\n请在 2 分钟内完成验证，超时将导致被封禁。", parse_mode: 'HTML' });
         } else if (mode === 'math') {
             const a = Math.floor(Math.random() * 10), b = Math.floor(Math.random() * 10);
             await env.KV.put(tempKey, JSON.stringify({ type: 'math', ans: a + b }), { expirationTtl: 180 });
-            return tgRequest(token, 'sendMessage', { chat_id: userId, text: `🔒 <b>安全验证</b>\n\n本机器人已开启人机验证，请计算结果（直接发送数字）: ${a} + ${b} = ?\n\n请在 2 分钟内完成完成验证，超时将导致被封禁。`, parse_mode: 'HTML' });
+            return tgRequest(token, 'sendMessage', { chat_id: userId, text: `🔒 <b>安全验证</b>\n\n本机器人已开启人机验证，请计算结果（直接发送数字）: ${a} + ${b} = ?\n\n请在 2 分钟内完成验证，超时将导致被封禁。`, parse_mode: 'HTML' });
         }
     }
 
@@ -1159,6 +1308,7 @@ async function initializeUser(env, groupId, msg, userId, token, options = {}) {
 
         // 2. Thread -> User (用于快速反查)
         await env.KV.put(`thread:${threadId}`, String(userId));
+        memSet(`thread:${threadId}`, String(userId));
 
         const firstName = escapeHtml(msg.from.first_name || '');
         const lastName = escapeHtml(msg.from.last_name || '');
@@ -1177,20 +1327,13 @@ async function initializeUser(env, groupId, msg, userId, token, options = {}) {
 
         const sendRes = await tgRequest(token, 'sendMessage', { chat_id: groupId, message_thread_id: threadId, text: infoMsg, parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: "👉 点击查看", url: uidLink }]] } });
         if (!sendRes || !sendRes.ok) {
-            console.error(`[NewUserCard Fail] User ${userId}: ${sendRes?.description}, falling back to name mention.`);
-            const nameMention = `<a href="tg://user?id=${userId}">${fullName}</a>`;
-            const fallbackText = recreate
-                ? `⚠️ ${nameMention} (ID: <code>${userId}</code>) 会话已恢复`
-                : `👤 ${nameMention} (ID: <code>${userId}</code>) 已加入会话`;
-            await tgRequest(token, 'sendMessage', { chat_id: groupId, message_thread_id: threadId, text: fallbackText, parse_mode: 'HTML' });
+            console.error(`[NewUserCard Fail] User ${userId}: ${sendRes?.description}, falling back to card without button.`);
+            await tgRequest(token, 'sendMessage', { chat_id: groupId, message_thread_id: threadId, text: infoMsg, parse_mode: 'HTML' });
         }
-        if (!recreate) await sendWelcomeMessage(env, userId);
+        if (!recreate && !options.isEdited) await sendWelcomeMessage(env, userId);
 
         if (!msg.text || !msg.text.startsWith('/start')) {
-            await Promise.all([
-                reactToMessage(token, userId, msg.message_id, msg.media_group_id),
-                forwardMessage(env, token, groupId, userId, msg, threadId),
-            ]);
+            await forwardMessage(env, token, groupId, userId, msg, threadId, options.isEdited || false);
         }
     } catch (e) {
         return tgRequest(token, 'sendMessage', { chat_id: userId, text: "Error: " + e.message });

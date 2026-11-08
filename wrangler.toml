@@ -1,0 +1,9 @@
+name = "relaygobot"
+main = "worker.js"
+compatibility_date = "2024-09-23"
+
+# 提示：环境变量和 KV 绑定建议直接在 Cloudflare 控制台 (Settings) 添加，
+# 也可在下方取消注释填入你的 KV 命名空间 ID：
+# [[kv_namespaces]]
+# binding = "KV"
+# id = "<YOUR_KV_NAMESPACE_ID>"
