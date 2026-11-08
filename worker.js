@@ -179,15 +179,29 @@ async function tgRequest(token, method, payload) {
     }
 }
 
-// 给原始消息添加 Telegram 原生表情回应；失败不应影响消息转发。
-async function reactToMessage(token, chatId, messageId) {
+// 给原始消息添加 Telegram 原生表情回应；支持相册防抖与静默容错
+const recentReactionMediaGroups = new Set();
+async function reactToMessage(token, chatId, messageId, mediaGroupId = null) {
     if (!token || chatId === undefined || chatId === null || !messageId) return;
-    return tgRequest(token, 'setMessageReaction', {
-        chat_id: chatId,
-        message_id: messageId,
-        reaction: [{ type: 'emoji', emoji: '🐳' }],
-        is_big: false,
-    });
+    if (mediaGroupId) {
+        if (recentReactionMediaGroups.has(mediaGroupId)) return;
+        recentReactionMediaGroups.add(mediaGroupId);
+        setTimeout(() => recentReactionMediaGroups.delete(mediaGroupId), 10000);
+    }
+    try {
+        await fetch(`https://api.telegram.org/bot${token}/setMessageReaction`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                chat_id: chatId,
+                message_id: messageId,
+                reaction: [{ type: 'emoji', emoji: '🐳' }],
+                is_big: false,
+            })
+        });
+    } catch (_) {
+        // 静默处理，避免群组禁用 reaction 时刷屏错误日志
+    }
 }
 
 function isTopicNotFoundError(result) {
@@ -925,7 +939,7 @@ async function handleGroupMessage(env, msg) {
         }
     }
     const [, result] = await Promise.all([
-        reactToMessage(env.BOT_TOKEN, msg.chat.id, msg.message_id),
+        reactToMessage(env.BOT_TOKEN, msg.chat.id, msg.message_id, msg.media_group_id),
         forwardMessage(env, env.BOT_TOKEN, userId, msg.chat.id, msg),
     ]);
     if (result && !result.ok) {
@@ -1020,7 +1034,7 @@ async function handleUserPrivateMessage(env, groupId, msg) {
             }
         }
         const [, result] = await Promise.all([
-            reactToMessage(token, userId, msg.message_id),
+            reactToMessage(token, userId, msg.message_id, msg.media_group_id),
             forwardToGroupWithRecovery(env, token, groupId, userId, msg, userData.thread_id, userData),
         ]);
         return result;
@@ -1167,7 +1181,7 @@ async function initializeUser(env, groupId, msg, userId, token, options = {}) {
 
         if (!msg.text || !msg.text.startsWith('/start')) {
             await Promise.all([
-                reactToMessage(token, userId, msg.message_id),
+                reactToMessage(token, userId, msg.message_id, msg.media_group_id),
                 forwardMessage(env, token, groupId, userId, msg, threadId),
             ]);
         }

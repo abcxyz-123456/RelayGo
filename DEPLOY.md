@@ -38,6 +38,7 @@
 |:----:|:-------:|:---:|
 | Secret | `BOT_TOKEN` | 你的机器人 token（可以在 [@BotFather](https://t.me/BotFather) 查看） |
 | Secret | `OWNER_ID` | 你的 Telegram UID（可以通过 [@getidsbot](https://t.me/getidsbot) 获取） |
+| Secret (可选) | `WEBHOOK_SECRET` | Webhook 鉴权密钥（可填写自定义强随机字符串，用于防伪造请求） |
 
 ## 六、设置 Telegram Webhook
 
@@ -46,6 +47,11 @@
 ```
 https://api.telegram.org/bot<你的token>/setWebhook?url=https://<你的worker域名>/webhook
 ```
+
+> **提示（可选安全加固）**：若在第五步配置了 `WEBHOOK_SECRET`，请在 setWebhook 链接末尾附加 `&secret_token=<你的WEBHOOK_SECRET>`，例如：
+> ```
+> https://api.telegram.org/bot<你的token>/setWebhook?url=https://<你的worker域名>/webhook&secret_token=<你的WEBHOOK_SECRET>
+> ```
 
 示例：
 
